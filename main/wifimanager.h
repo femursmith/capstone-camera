@@ -15,7 +15,12 @@ void load_camera_id(void);
 // The parameter camera_id is expected to be a null-terminated string.
 void save_camera_id(const char *camera_id);
 
-extern char stored_camera_id[50]; 
+void load_user_id(void);
+
+void save_user_id(const char *user_id);
+
+extern char stored_camera_id[37]; 
+extern char stored_user_id[22];
 #ifdef __cplusplus
 }
 #endif

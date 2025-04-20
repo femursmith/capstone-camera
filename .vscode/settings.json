@@ -1,7 +1,18 @@
 {
-    "idf.portWin": "COM3",
+    "idf.portWin": "COM6",
     "idf.flashType": "UART",
     "files.associations": {
-        "wifimanager.h": "c"
-    }
+        "wifimanager.h": "c",
+        "string.h": "c",
+        "stdint.h": "c",
+        "camera.h": "c",
+        "recorder.h": "c",
+        "events.h": "c"
+    },
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ]
 }

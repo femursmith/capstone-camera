@@ -17,6 +17,7 @@
 #include "esp_netif.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 
 #include "wifimanager.h"
 
@@ -33,6 +34,9 @@ typedef struct {
     char password[65];  // up to 64 characters + null
 } wifi_credentials_t;
 
+static esp_timer_handle_t green_led_timer;
+
+
 
 #define UART_PORT_NUM      UART_NUM_0
 #define UART_BAUD_RATE     115200
@@ -43,7 +47,8 @@ typedef struct {
 // Global storage (simulate NVS storage for demonstration)
 wifi_credentials_t stored_wifi[MAX_WIFI_CREDENTIALS];
 int wifi_credentials_count = 0;
-char stored_camera_id[50] = {0};
+char stored_camera_id[37] = {0};
+char stored_user_id[22] = {0};
 
 // Event group to signal WiFi connection
 static EventGroupHandle_t wifi_event_group;
@@ -52,6 +57,7 @@ const int WIFI_CONNECTED_BIT = BIT0;
 wifi_credentials_t current_wifi = {0};
 
 // ---------- Forward Declarations ----------
+static void init_leds(void);
 void handle_wifi_connect(void);
 void start_mdns(void);
 static void wifi_init_sta(void);
@@ -67,6 +73,25 @@ static esp_err_t save_post_handler(httpd_req_t *req);
 
 
 
+static void init_leds() {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << 1) | (1ULL << 2), // GPIO1 (blue) and GPIO2 (green)
+        .pull_down_en = 0,
+        .pull_up_en = 0
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    // Initially turn off both LEDs
+    gpio_set_level(1, 0); // Blue off
+    gpio_set_level(2, 0); // Green off
+    ESP_LOGI(TAG, "LEDs initialized on GPIO1 (blue) and GPIO2 (green)");
+}
+
+static void turn_off_green(void* arg) {
+    gpio_set_level(2, 0); // Turn off green LED
+    ESP_LOGI(TAG, "Green LED turned off after 10 seconds");
+}
 // Function to initialize UART2
 static void uart_init_custom(void)
 {
@@ -134,18 +159,6 @@ static void generate_random_camera_secret(char *dest, size_t len)
     dest[len - 1] = '\0';
 }
 
-// ---------- WiFi Event Handler ----------
-
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,int32_t event_id, void* event_data){
-	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-	ESP_LOGI(TAG, "Disconnected");
-	// Clear connection flag so a new attempt can be made.
-	xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-	} else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-	ESP_LOGI(TAG, "Got IP");
-	xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-	}
-}
 
 // ---------- Simulated NVS Functions ----------
 
@@ -249,6 +262,69 @@ void save_camera_id(const char *camera_id)
     nvs_close(nvs_handle);
     ESP_LOGI(TAG, "Saved camera ID: %s", stored_camera_id);
 }
+
+void load_user_id(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "NVS namespace 'storage' not found. No stored user ID.");
+        stored_user_id[0] = '\0';
+        nvs_close(nvs_handle);
+        return;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) opening NVS handle for reading user ID!", esp_err_to_name(err));
+        stored_user_id[0] = '\0';
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    size_t required_size = sizeof(stored_user_id);
+    err = nvs_get_str(nvs_handle, "userid", stored_user_id, &required_size);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No user ID found in NVS");
+        stored_user_id[0] = '\0';
+    } else {
+        ESP_LOGI(TAG, "Found user ID: %s", stored_user_id);
+    }
+
+    nvs_close(nvs_handle);
+}
+
+void save_user_id(const char *user_id)
+{
+    if (user_id == NULL) {
+        ESP_LOGW(TAG, "save_user_id called with NULL pointer");
+        return;
+    }
+
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) opening NVS handle for writing user ID!", esp_err_to_name(err));
+        return;
+    }
+
+    // Copy to global variable
+    strncpy(stored_user_id, user_id, sizeof(stored_user_id) - 1);
+    stored_user_id[sizeof(stored_user_id) - 1] = '\0';
+
+    // Save to NVS
+    err = nvs_set_str(nvs_handle, "userid", stored_user_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error setting userid: %s", esp_err_to_name(err));
+    }
+
+    // Commit changes
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error committing user ID changes to NVS: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Saved user ID: %s", stored_user_id);
+}
+
 
 static void load_wifi_credentials(void)
 {
@@ -860,23 +936,32 @@ void uart_request_task(void *pvParameters)
     }
 }
 
-static void wifi_connect_task(void )
-{
+static void wifi_connect_task(void) {
     bool connected = false;
-    // Try up to 2 rounds of connection attempts over all stored credentials.
     for (int round = 0; round < 2 && !connected; round++) {
         for (int i = 0; i < wifi_credentials_count && !connected; i++) {
-            connected = try_connect_to_ssid(&stored_wifi[i]);
-            if (connected) {
+            ESP_LOGI(TAG, "Attempting connection to SSID: %s", stored_wifi[i].ssid);
+            wifi_config_t wifi_config = {0};
+            strncpy((char*)wifi_config.sta.ssid, stored_wifi[i].ssid, sizeof(wifi_config.sta.ssid)-1);
+            strncpy((char*)wifi_config.sta.password, stored_wifi[i].password, sizeof(wifi_config.sta.password)-1);
+            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+                ESP_LOGE(TAG, "Failed to initiate connection: %s", esp_err_to_name(err));
+                continue;
+            }
+            EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdTRUE, pdTRUE, 5000 / portTICK_PERIOD_MS);
+            if (bits & WIFI_CONNECTED_BIT) {
+                connected = true;
                 memcpy(&current_wifi, &stored_wifi[i], sizeof(wifi_credentials_t));
                 ESP_LOGI(TAG, "Connected to %s", stored_wifi[i].ssid);
                 break;
             }
-            // Optionally, wait a short moment before trying the next credential.
+            ESP_LOGI(TAG, "Timeout connecting to %s, disconnecting", stored_wifi[i].ssid);
+            esp_wifi_disconnect();
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
     }
-
     if (!connected) {
         ESP_LOGI(TAG, "Failed to connect to any stored network. Switching to AP mode.");
         esp_wifi_stop();
@@ -884,19 +969,13 @@ static void wifi_connect_task(void )
         start_mdns();
         start_webserver();
     }
-    return;
 }
 
 
 
-static void wifi_init_sta(void)
-{
-    // Do NOT call esp_netif_init() or esp_event_loop_create_default() here; they've been created already.
-    // esp_netif_create_default_wifi_sta() can be called once in app_main.
+static void wifi_init_sta(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
@@ -904,19 +983,15 @@ static void wifi_init_sta(void)
 
 // ---------- WiFi Initialization (AP Mode) ----------
 
-static void wifi_init_softap(void)
-{
-    // Do not call esp_netif_init() here if it's already called in app_main!
+static void wifi_init_softap(void) {
     esp_netif_create_default_wifi_ap();
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
     wifi_config_t ap_config = {
         .ap = {
-            .ssid = "ESP32_Config",
+            .ssid = "HomeSecurity",
             .ssid_len = 0,
-            .password = "configureme",
+            .password = "homeadmin",
             .max_connection = 4,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK,
         },
@@ -927,38 +1002,69 @@ static void wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
     ESP_LOGI(TAG, "SoftAP started. SSID:%s password:%s", ap_config.ap.ssid, ap_config.ap.password);
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_STA_START) {
+            ESP_LOGI(TAG, "WiFi STA started");
+            gpio_set_level(1, 0);
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            ESP_LOGI(TAG, "Disconnected");
+            gpio_set_level(1, 1);
+            xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        } else if (event_id == WIFI_EVENT_AP_START) {
+            ESP_LOGI(TAG, "WiFi AP started");
+            gpio_set_level(1, 1); // Turn on blue LED
+            gpio_set_level(2, 1); // Turn on green LED (AP mode)
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "Got IP");
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        gpio_set_level(1, 0);
+        gpio_set_level(2, 1); // Turn on green LED (success)
+        esp_timer_start_once(green_led_timer, 10000000); // 10 seconds in microseconds
+        ESP_LOGI(TAG, "WiFi connected successfully, green LED on for 10 seconds");
+    }
 }
 
 
 
 
 
+void handle_wifi_connect(void) {
+    init_leds();
 
-void handle_wifi_connect(void)
-{
-    
+    // Create timer for green LED
+    esp_timer_create_args_t timer_args = {
+        .callback = &turn_off_green,
+        .arg = NULL,
+        .name = "green_led_timer"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &green_led_timer));
+
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-	seed_random_generator();
-    
+
+    // Register event handlers
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
     uart_init_custom();
     load_wifi_credentials();
-    
     wifi_event_group = xEventGroupCreate();
 
-	
     if (wifi_credentials_count == 0 || stored_camera_id[0] == '\0') {
         ESP_LOGI(TAG, "No WiFi credentials found. Starting in AP mode for initial configuration.");
         wifi_init_softap();
-		start_mdns();
-        start_webserver();	
+        start_mdns();
+        start_webserver();
     } else {
         esp_netif_create_default_wifi_sta();
-        wifi_init_sta();  // Remove duplicate esp_event_loop_create_default() from this function.
-        wifi_connect_task();    
+        wifi_init_sta();
+        wifi_connect_task();
     }
 }
 

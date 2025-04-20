@@ -7,3 +7,4 @@ dependencies:
     path: ${IDF_PATH}/examples/common_components/protocol_examples_common
   sepfy/libpeer: '>=0.0.2'
   espressif/mdns: ^1.8.2
+  espressif/avi_player: ^1.0.0
